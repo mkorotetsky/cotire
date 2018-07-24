@@ -2171,7 +2171,7 @@ function (cotire_get_prefix_header_dependencies _language _target _dependencySou
 	set (${_dependencySourcesVar} ${_dependencySources} PARENT_SCOPE)
 endfunction()
 
-function (cotire_generate_target_script _language _configurations _target _targetScriptVar _targetConfigScriptVar)
+function (cotire_generate_target_script _language _configurations _target _targetScriptVar _targetConfigScriptVar _depFile _pchFile)
 	set (_targetSources ${ARGN})
 	cotire_get_prefix_header_dependencies(${_language} ${_target} COTIRE_TARGET_PREFIX_DEPENDS ${_targetSources})
 	cotire_get_unity_source_dependencies(${_language} ${_target} COTIRE_TARGET_UNITY_DEPENDS ${_targetSources})
@@ -2196,6 +2196,12 @@ function (cotire_generate_target_script _language _configurations _target _targe
 			"${_config}" "${_language}" "${_target}" COTIRE_TARGET_COMPILE_DEFINITIONS_${_upperConfig})
 		cotire_get_target_compiler_flags(
 			"${_config}" "${_language}" "${_target}" COTIRE_TARGET_COMPILE_FLAGS_${_upperConfig})
+		
+		#if(_depFile)
+			string(REPLACE "${CMAKE_BINARY_DIR}/" "" _pchFile "${_pchFile}")
+			set(COTIRE_TARGET_COMPILE_FLAGS_${_upperConfig} "-MMD;-MF${_depFile};-MT${_pchFile};${COTIRE_TARGET_COMPILE_FLAGS_${_upperConfig}}")
+		#endif()
+			
 		cotire_get_source_files_compile_definitions(
 			"${_config}" "${_language}" COTIRE_TARGET_SOURCES_COMPILE_DEFINITIONS_${_upperConfig} ${_targetSources})
 	endforeach()
@@ -2259,7 +2265,7 @@ function (cotire_generate_target_script _language _configurations _target _targe
 	set (${_targetConfigScriptVar} "${_targetCotireConfigScript}" PARENT_SCOPE)
 endfunction()
 
-function (cotire_setup_pch_file_compilation _language _target _targetScript _prefixFile _pchFile _hostFile)
+function (cotire_setup_pch_file_compilation _language _target _targetScript _prefixFile _pchFile _depFile _hostFile)
 	set (_sourceFiles ${ARGN})
 	if (CMAKE_${_language}_COMPILER_ID MATCHES "MSVC|Intel")
 		# for Visual Studio and Intel, we attach the precompiled header compilation to the host file
@@ -2290,14 +2296,16 @@ function (cotire_setup_pch_file_compilation _language _target _targetScript _pre
 			# re-compilation when the compiler executable is updated. This prevents "created by a different GCC executable"
 			# warnings when the precompiled header is included.
 			get_filename_component(_realCompilerExe "${CMAKE_${_language}_COMPILER}" ABSOLUTE)
+			string(REPLACE "${CMAKE_BINARY_DIR}/" "" _depFile "${_depFile}")
 			if (COTIRE_DEBUG)
-				message (STATUS "add_custom_command: OUTPUT ${_pchFile} ${_cmds} DEPENDS ${_prefixFile} ${_realCompilerExe} IMPLICIT_DEPENDS ${_language} ${_prefixFile}")
+				message (STATUS "add_custom_command: OUTPUT ${_pchFile} ${_cmds} DEPENDS ${_prefixFile} ${_realCompilerExe} IMPLICIT_DEPENDS ${_language} ${_prefixFile} DEPFILE ${_depFile}")
 			endif()
 			set_property (SOURCE "${_pchFile}" PROPERTY GENERATED TRUE)
 			add_custom_command(
 				OUTPUT "${_pchFile}"
 				COMMAND ${_cmds}
 				DEPENDS "${_prefixFile}" "${_realCompilerExe}"
+				DEPFILE "${_depFile}"
 				IMPLICIT_DEPENDS ${_language} "${_prefixFile}"
 				WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 				COMMENT "Building ${_language} precompiled header ${_pchFileLogPath}"
@@ -2845,8 +2853,20 @@ function (cotire_process_target_language _language _configurations _target _whol
 	if (NOT _unitySourceFiles)
 		set (_unitySourceFiles ${_sourceFiles} ${_cotiredSources})
 	endif()
+	# check if selected language has enough sources at all
+	list (LENGTH _sourceFiles _numberOfSources)
+	if (_numberOfSources LESS ${COTIRE_MINIMUM_NUMBER_OF_TARGET_SOURCES})
+		set (_targetUsePCH FALSE)
+	else()
+		get_target_property(_targetUsePCH ${_target} COTIRE_ENABLE_PRECOMPILED_HEADER)
+	endif()
+	cotire_make_prefix_file_path(${_language} ${_target} _prefixFile)	
+	if (_targetUsePCH)
+		set(_depFile "${_prefixFile}.d")
+		cotire_make_pch_file_path(${_language} ${_target} _pchFile)
+	endif()
 	cotire_generate_target_script(
-		${_language} "${_configurations}" ${_target} _targetScript _targetConfigScript ${_unitySourceFiles})
+		${_language} "${_configurations}" ${_target} _targetScript _targetConfigScript "${_depFile}" "${_pchFile}" ${_unitySourceFiles})
 	# set up unity files for parallel compilation
 	cotire_compute_unity_max_number_of_includes(${_target} _maxIncludes ${_unitySourceFiles})
 	cotire_make_unity_source_file_paths(${_language} ${_target} ${_maxIncludes} _unityFiles ${_unitySourceFiles})
@@ -2861,7 +2881,6 @@ function (cotire_process_target_language _language _configurations _target _whol
 	cotire_make_single_unity_source_file_path(${_language} ${_target} _unityFile)
 	cotire_setup_unity_generation_commands(
 		${_language} ${_target} "${_targetScript}" "${_targetConfigScript}" "${_unityFile}" _cmds ${_unitySourceFiles})
-	cotire_make_prefix_file_path(${_language} ${_target} _prefixFile)
 	# set up prefix header
 	if (_prefixFile)
 		# check for user provided prefix header files
@@ -2873,19 +2892,11 @@ function (cotire_process_target_language _language _configurations _target _whol
 			cotire_setup_prefix_generation_from_unity_command(
 				${_language} ${_target} "${_targetConfigScript}" "${_prefixFile}" "${_unityFile}" _cmds ${_unitySourceFiles})
 		endif()
-		# check if selected language has enough sources at all
-		list (LENGTH _sourceFiles _numberOfSources)
-		if (_numberOfSources LESS ${COTIRE_MINIMUM_NUMBER_OF_TARGET_SOURCES})
-			set (_targetUsePCH FALSE)
-		else()
-			get_target_property(_targetUsePCH ${_target} COTIRE_ENABLE_PRECOMPILED_HEADER)
-		endif()
 		if (_targetUsePCH)
-			cotire_make_pch_file_path(${_language} ${_target} _pchFile)
 			if (_pchFile)
 				# first file in _sourceFiles is passed as the host file
 				cotire_setup_pch_file_compilation(
-					${_language} ${_target} "${_targetConfigScript}" "${_prefixFile}" "${_pchFile}" ${_sourceFiles})
+					${_language} ${_target} "${_targetConfigScript}" "${_prefixFile}" "${_pchFile}" "${_depFile}" ${_sourceFiles})
 				cotire_setup_pch_file_inclusion(
 					${_language} ${_target} ${_wholeTarget} "${_prefixFile}" "${_pchFile}" ${_sourceFiles})
 			endif()
